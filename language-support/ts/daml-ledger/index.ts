@@ -220,6 +220,12 @@ type LedgerOptions = {
    * as it is the case with the development server of `create-react-app`.
    */
   wsBaseUrl?: string;
+  /**
+   * Optional number of milliseconds a connection has to be live to be considered healthy. If the
+   * connection is closed after being live for at least this amount of time, the `Ledger` tries to
+   * reconnect, else not.
+   */
+  wsMinLiveTime?: number;
 }
 
 /**
@@ -229,11 +235,12 @@ class Ledger {
   private readonly token: string;
   private readonly httpBaseUrl: string;
   private readonly wsBaseUrl: string;
+  private readonly wsMinLiveTime: number;
 
   /**
    * Construct a new `Ledger` object. See [[LedgerOptions]] for the constructor arguments.
    */
-  constructor({token, httpBaseUrl, wsBaseUrl}: LedgerOptions) {
+  constructor({token, httpBaseUrl, wsBaseUrl, wsMinLiveTime = 30000}: LedgerOptions) {
     if (!httpBaseUrl) {
       httpBaseUrl = `${window.location.protocol}//${window.location.host}/`;
     }
@@ -256,6 +263,7 @@ class Ledger {
     this.token = token;
     this.httpBaseUrl = httpBaseUrl;
     this.wsBaseUrl = wsBaseUrl;
+    this.wsMinLiveTime = wsMinLiveTime;
   }
 
   /**
@@ -487,12 +495,14 @@ class Ledger {
     template: Template<T, K, I>,
     endpoint: string,
     request: unknown,
+    reconnectRequest: (offset: string) => unknown,
     init: State,
     change: (state: State, events: readonly Event<T, K, I>[]) => State,
   ): Stream<T, K, I, State> {
     const protocols = ['jwt.token.' + this.token, 'daml.ws.auth'];
     const ws = new WebSocket(this.wsBaseUrl + endpoint, protocols);
-    let isLive = false;
+    let isLiveSince: undefined | number = undefined;
+    let lastOffset: undefined | string = undefined;
     let state = init;
     const emitter = new EventEmitter();
     ws.addEventListener('open', () => {
@@ -506,9 +516,12 @@ class Ledger {
           state = change(state, events);
           emitter.emit('change', state, events);
         }
-        if (isRecordWith('offset', json) && !isLive) {
-          isLive = true;
-          emitter.emit('live', state);
+        if (isRecordWith('offset', json)) {
+          lastOffset = jtv.Result.withException(jtv.string().run(json.offset));
+          if (!isLiveSince) {
+            isLiveSince = new Date().getTime();
+            emitter.emit('live', state);
+          }
         }
       } else if (isRecordWith('warnings', json)) {
         console.warn('Ledger.streamQuery warnings', json);
@@ -522,6 +535,13 @@ class Ledger {
     // 'close' event, which we need to handle anyway.
     ws.addEventListener('close', ({code, reason}) => {
       emitter.emit('close', {code, reason});
+      const now = new Date().getTime();
+      // we try to reconnect if we could connect previously and we were live for at least
+      // 'minLiveTime'.
+      if (lastOffset && isLiveSince && now - isLiveSince >= this.wsMinLiveTime) {
+        isLiveSince = undefined;
+        ws.send(JSON.stringify(reconnectRequest(lastOffset)));
+      }
     });
     // TODO(MH): Make types stricter.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -556,6 +576,7 @@ class Ledger {
     query?: Query<T>,
   ): Stream<T, K, I, readonly CreateEvent<T, K, I>[]> {
     const request = {templateIds: [template.templateId], query};
+    const reconnectRequest = ((offset: string): object[] => [{'offset': offset}, request]);
     const change = (contracts: readonly CreateEvent<T, K, I>[], events: readonly Event<T, K, I>[]): CreateEvent<T, K, I>[] => {
       const archiveEvents: Set<ContractId<T>> = new Set();
       const createEvents: CreateEvent<T, K, I>[] = [];
@@ -570,7 +591,7 @@ class Ledger {
         .concat(createEvents)
         .filter(contract => !archiveEvents.has(contract.contractId));
     };
-    return this.streamSubmit(template, 'v1/stream/query', request, [], change);
+    return this.streamSubmit(template, 'v1/stream/query', request, reconnectRequest, [], change);
   }
 
   /**
@@ -586,7 +607,9 @@ class Ledger {
     template: Template<T, K, I>,
     key: K,
   ): Stream<T, K, I, CreateEvent<T, K, I> | null> {
+    let lastContractId: ContractId<T> | null = null;
     const request = [{templateId: template.templateId, key}];
+    const reconnectRequest = (offset: string): object[] => [{'offset': offset}, {...request[0], 'contractIdAtOffset': lastContractId}]
     const change = (contract: CreateEvent<T, K, I> | null, events: readonly Event<T, K, I>[]): CreateEvent<T, K, I> | null => {
       // NOTE(MH, #4564): We're very lenient here. We should not see a create
       // event when `contract` is currently not null. We should also only see
@@ -602,9 +625,10 @@ class Ledger {
           }
         }
       }
+      lastContractId = contract ? contract.contractId : null
       return contract;
     }
-    return this.streamSubmit(template, 'v1/stream/fetch', request, null, change);
+    return this.streamSubmit(template, 'v1/stream/fetch', request, reconnectRequest, null, change);
   }
 }
 

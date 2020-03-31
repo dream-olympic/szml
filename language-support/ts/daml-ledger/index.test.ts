@@ -12,7 +12,8 @@ const mockLive = jest.fn();
 const mockChange = jest.fn();
 const mockConstructor = jest.fn();
 const mockSend = jest.fn();
-const mockFunctions = [mockLive, mockChange, mockConstructor, mockSend];
+const mockClose = jest.fn();
+const mockFunctions = [mockLive, mockChange, mockConstructor, mockSend, mockClose];
 
 type Foo = {key: string};
 const fooKey = 'fooKey';
@@ -162,6 +163,22 @@ describe("streamQuery", () => {
     expect(mockChange).toHaveBeenLastCalledWith([fooCreateEvent(1)])
   });
 
+  test("reconnect on close", () => {
+    const ledger = new Ledger({...mockOptions, wsMinLiveTime: 0} );
+    const stream = ledger.streamQuery(Foo);
+    stream.on("live", mockLive);
+    stream.on("close", mockClose);
+    mockInstance.serverSend({events: [], offset: '3'});
+    mockInstance.serverClose({code: 1, reason: 'test close'});
+    expect(mockSend).toHaveBeenCalledTimes(1)
+    expect(mockSend).toHaveBeenLastCalledWith([{"offset": "3"}, {"templateIds": ["foo-id"]}]);
+    mockSend.mockClear();
+
+    //check that the client doesn't try to reconnect again.
+    mockInstance.serverClose({code: 1, reason: 'test close'});
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
   test("receive empty events", () => {
     const ledger = new Ledger(mockOptions);
     const stream = ledger.streamQuery(Foo);
@@ -240,5 +257,29 @@ describe("streamFetchByKey", () => {
     mockInstance.serverSend({ events: [fooArchiveEvent(1)] });
     expect(mockChange).toHaveBeenCalledTimes(1);
     expect(mockChange).toHaveBeenCalledWith(null);
+  });
+
+  test("reconnect on close", () => {
+    const ledger = new Ledger({...mockOptions, wsMinLiveTime: 0} );
+    const stream = ledger.streamFetchByKey(Foo, fooKey);
+    stream.on("live", mockLive);
+    stream.on("close", mockClose);
+    //send live event, but no contract yet.
+    mockInstance.serverSend({events: [], offset: '3'});
+    mockInstance.serverClose({code: 1, reason: 'test close'});
+    expect(mockSend).toHaveBeenCalledTimes(1)
+    expect(mockSend).toHaveBeenLastCalledWith([{'offset': '3'}, {'key': 'fooKey', 'templateId': 'foo-id', 'contractIdAtOffset': null}]);
+    mockSend.mockClear();
+
+    //send live event and set the last contract id.
+    mockInstance.serverSend({events: [fooEvent(1)], offset: '3'});
+    mockInstance.serverClose({code: 1, reason: 'test close'});
+    expect(mockSend).toHaveBeenCalledTimes(1);
+    expect(mockSend).toHaveBeenLastCalledWith([{'offset': '3'}, {'key': 'fooKey', 'templateId': 'foo-id', 'contractIdAtOffset': '1'}]);
+    mockSend.mockClear();
+
+    //check that the client doesn't try to reconnect again.
+    mockInstance.serverClose({code: 1, reason: 'test close'});
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
