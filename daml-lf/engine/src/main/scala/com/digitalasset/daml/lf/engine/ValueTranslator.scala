@@ -6,7 +6,7 @@ package com.digitalasset.daml.lf.engine
 import java.util
 
 import com.digitalasset.daml.lf.CompiledPackages
-import com.digitalasset.daml.lf.data.Ref.{Name, PackageId}
+import com.digitalasset.daml.lf.data.Ref
 import com.digitalasset.daml.lf.data._
 import com.digitalasset.daml.lf.language.Ast._
 import com.digitalasset.daml.lf.language.Util._
@@ -43,7 +43,7 @@ private[engine] object ValueTranslator {
   private def missingPackage: Nothing =
     throw ValueTranslationMissingPackage
 
-  private def collectPkgIds(typ: Type): Set[PackageId] = {
+  private def collectPkgIds(typ: Type): Set[Ref.PackageId] = {
     val pkgIds = Set.newBuilder[Ref.PackageId]
     def go(typ0: Type): Unit =
       typ0 match {
@@ -269,7 +269,7 @@ private[engine] final class ValueTranslator(compiledPackages: CompiledPackages) 
 
                         SRecord(
                           typeRecordId,
-                          Name.Array(fields.map(_._1).toSeq: _*),
+                          Ref.Name.Array(fields.map(_._1).toSeq: _*),
                           ArrayList(fields.map(_._2).toSeq: _*)
                         )
                     }
@@ -313,7 +313,7 @@ private[engine] final class ValueTranslator(compiledPackages: CompiledPackages) 
       } catch {
         case ValueTranslationError(e) => ResultError(e)
         case ValueTranslationMissingPackage =>
-          // if one package is missing, we collect all of them, ask of them, and restart.
+          // if one package is missing, we collect all of them, ask for loading them, and restart.
           needPackages(
             collectPkgIds(ty0).filterNot(compiledPackages.packages.isDefinedAt).toList,
             restart
