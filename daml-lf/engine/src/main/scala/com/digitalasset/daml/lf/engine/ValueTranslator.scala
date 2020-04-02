@@ -6,17 +6,17 @@ package com.digitalasset.daml.lf.engine
 import java.util
 
 import com.digitalasset.daml.lf.CompiledPackages
-import com.digitalasset.daml.lf.data.Ref.Name
+import com.digitalasset.daml.lf.data.Ref.{Name, PackageId}
 import com.digitalasset.daml.lf.data._
 import com.digitalasset.daml.lf.language.Ast._
 import com.digitalasset.daml.lf.language.Util._
 import com.digitalasset.daml.lf.speedy.SValue
-import com.digitalasset.daml.lf.speedy.SValue.SValueContainer
 import com.digitalasset.daml.lf.value.Value
 import com.digitalasset.daml.lf.value.Value._
 
 import scala.annotation.tailrec
 import scala.collection.immutable.HashMap
+import scala.util.control.NoStackTrace
 
 private[engine] object ValueTranslator {
 
@@ -27,15 +27,46 @@ private[engine] object ValueTranslator {
   }
 
   // we use this for easier error handling in translateValues
-  private final case class ValueTranslationException(err: Error)
+  private final case class ValueTranslationError(err: Error)
       extends RuntimeException(err.toString, null, true, false)
 
-  private def fail(s: String): Nothing =
-    throw ValueTranslationException(Error(s))
+  private final case object ValueTranslationMissingPackage
+      extends RuntimeException
+      with NoStackTrace
 
+  private def fail(s: String): Nothing =
+    throw ValueTranslationError(Error(s))
+
+  private def fail(e: Error): Nothing =
+    throw ValueTranslationError(e)
+
+  private def missingPackage: Nothing =
+    throw ValueTranslationMissingPackage
+
+  private def collectPkgIds(typ: Type): Set[PackageId] = {
+    val pkgIds = Set.newBuilder[Ref.PackageId]
+    def go(typ0: Type): Unit =
+      typ0 match {
+        case TBuiltin(_) =>
+        case TTyCon(tycon) => pkgIds += tycon.packageId
+        case TApp(tyfun, arg) => go(tyfun); go(arg)
+        case TStruct(_) | TSynApp(_, _) | TForall(_, _) | TNat(_) | TVar(_) =>
+          fail(s"unserializable type ${typ0.pretty}")
+      }
+    go(typ)
+    pkgIds.result()
+  }
+
+  private def needPackages(pkgs: List[Ref.PackageId], restart: => Result[SValue]): Result[SValue] =
+    pkgs match {
+      case head :: tail =>
+        ResultNeedPackage(head, _ => needPackages(tail, restart))
+      case Nil =>
+        restart
+    }
 }
 
-private[engine] class ValueTranslator(compiledPackages: CompiledPackages) {
+private[engine] final class ValueTranslator(compiledPackages: CompiledPackages) {
 
   import ValueTranslator._
 
@@ -91,28 +122,12 @@ private[engine] class ValueTranslator(compiledPackages: CompiledPackages) {
     go(fields, Map.empty)
   }
 
-  private object SValueResultDone extends SValueContainer[ResultDone[SValue]] {
-    override def apply(value: SValue): ResultDone[SValue] = ResultDone(value)
-  }
-
   // since we get these values from third-party users of the library, check the recursion limit
   // here, too.
   private[engine] def translateValue(ty0: Type, v0: Value[AbsoluteContractId]): Result[SValue] = {
-    import SValue._
-    import scalaz.std.option._
-    import scalaz.syntax.traverse.ToTraverseOps
+    import SValue.{SValue => _, _}
 
-    def exceptionToResultError[A](x: => Result[A]): Result[A] =
-      try {
-        x
-      } catch {
-        case ValueTranslationException(err) => ResultError(err)
-      }
-
-    def go(nesting: Int, ty: Type, value: Value[AbsoluteContractId]): Result[SValue] = {
-      // we use this to restart when we get a new package that allows us to make progress.
-      def restart = exceptionToResultError(go(nesting, ty, value))
-
+    def go(nesting: Int, ty: Type, value: Value[AbsoluteContractId]): SValue = {
       if (nesting > Value.MAXIMUM_NESTING) {
         fail(s"Provided value exceeds maximum nesting level of ${Value.MAXIMUM_NESTING}")
       } else {
@@ -120,77 +135,67 @@ private[engine] class ValueTranslator(compiledPackages: CompiledPackages) {
         (ty, value) match {
           // simple values
           case (TUnit, ValueUnit) =>
-            SValueResultDone.Unit
+            SUnit
           case (TBool, ValueBool(b)) =>
-            SValueResultDone.bool(b)
+            if (b) SValue.SValue.True else SValue.SValue.False
           case (TInt64, ValueInt64(i)) =>
-            ResultDone(SInt64(i))
+            SInt64(i)
           case (TTimestamp, ValueTimestamp(t)) =>
-            ResultDone(STimestamp(t))
+            STimestamp(t)
           case (TDate, ValueDate(t)) =>
-            ResultDone(SDate(t))
+            SDate(t)
           case (TText, ValueText(t)) =>
-            ResultDone(SText(t))
+            SText(t)
           case (TNumeric(TNat(s)), ValueNumeric(d)) =>
-            Numeric.fromBigDecimal(s, d).fold(fail, d => ResultDone(SNumeric(d)))
+            Numeric.fromBigDecimal(s, d).fold(fail, SNumeric)
           case (TParty, ValueParty(p)) =>
-            ResultDone(SParty(p))
+            SParty(p)
           case (TContractId(typ), ValueContractId(c)) =>
             typ match {
-              case TTyCon(_) => ResultDone(SContractId(c))
+              case TTyCon(_) => SContractId(c)
               case _ => fail(s"Expected a type constructor but found $typ.")
             }
 
           // optional
           case (TOptional(elemType), ValueOptional(mb)) =>
-            mb.traverseU(go(newNesting, elemType, _)).map(SOptional)
+            SOptional(mb.map(go(newNesting, elemType, _)))
 
           // list
           case (TList(elemType), ValueList(ls)) =>
-            ls.toImmArray.traverseU(go(newNesting, elemType, _)).map(es => SList(FrontStack(es)))
+            SList(ls.map(go(newNesting, elemType, _)))
 
           // textMap
           case (TTextMap(elemType), ValueTextMap(map)) =>
-            map.toImmArray
-              .traverseU {
-                case (key0, value0) => go(newNesting, elemType, value0).map(key0 -> _)
-              }
-              .map(l => STextMap(HashMap(l.toSeq: _*)))
+            type O[_] = HashMap[String, SValue]
+            STextMap(map.iterator.map { case (k, v) => k -> go(newNesting, elemType, v) }.to[O])
 
           // genMap
           case (TGenMap(keyType, valueType), ValueGenMap(entries)) =>
-            entries
-              .traverseU {
-                case (key0, value0) =>
-                  for {
-                    key <- go(newNesting, keyType, key0)
-                    value <- go(newNesting, valueType, value0)
-                  } yield key -> value
-              }
-              .map(l => SGenMap(l.iterator))
+            SGenMap(entries.iterator.map {
+              case (k, v) => go(newNesting, keyType, k) -> go(newNesting, valueType, v)
+            })
 
           // variants
-          case (TTyConApp(tyCon, tyConArgs), ValueVariant(mbVariantId, constructorName, val0)) =>
-            val variantId = tyCon
+          case (
+              TTyConApp(typeVariantId, tyConArgs),
+              ValueVariant(mbVariantId, constructorName, val0)) =>
             mbVariantId match {
-              case Some(variantId_) if variantId != variantId_ =>
+              case Some(valueVariantId) if typeVariantId != valueVariantId =>
                 fail(
-                  s"Mismatching variant id, the type tells us $variantId, but the value tells us $variantId_")
+                  s"Mismatching variant id, the type tells us $typeVariantId, but the value tells us $valueVariantId")
               case _ =>
-                compiledPackages.getPackage(variantId.packageId) match {
-                  // if the package is not there, look it up and restart. stack safe since this will be done
-                  // very few times as the cache gets warm. this is also why we do not use the `Result.needDataType`, which
-                  // would consume stack regardless
+                compiledPackages.getPackage(typeVariantId.packageId) match {
+                  // if the package is not there, look for all the packages in the value and restart.
                   case None =>
-                    Result.needPackage(variantId.packageId, _ => restart)
+                    missingPackage
                   case Some(pkg) =>
-                    PackageLookup.lookupVariant(pkg, variantId.qualifiedName) match {
-                      case Left(err) => ResultError(err)
+                    PackageLookup.lookupVariant(pkg, typeVariantId.qualifiedName) match {
+                      case Left(err) => fail(err)
                       case Right((dataTypParams, variantDef: DataVariant)) =>
                         variantDef.constructorRank.get(constructorName) match {
                           case None =>
                             fail(
-                              s"Couldn't find provided variant constructor $constructorName in variant $variantId")
+                              s"Couldn't find provided variant constructor $constructorName in variant $typeVariantId")
                           case Some(rank) =>
                             val (_, argTyp) = variantDef.variants(rank)
                             if (dataTypParams.length != tyConArgs.length) {
@@ -199,29 +204,29 @@ private[engine] class ValueTranslator(compiledPackages: CompiledPackages) {
                             }
                             val instantiatedArgTyp =
                               replaceParameters(dataTypParams.map(_._1).zip(tyConArgs), argTyp)
-                            go(newNesting, instantiatedArgTyp, val0).map(
-                              SVariant(tyCon, constructorName, rank, _))
+                            SVariant(
+                              typeVariantId,
+                              constructorName,
+                              rank,
+                              go(newNesting, instantiatedArgTyp, val0))
                         }
                     }
                 }
             }
           // records
-          case (TTyConApp(tyCon, tyConArgs), ValueRecord(mbRecordId, flds)) =>
-            val recordId = tyCon
+          case (TTyConApp(typeRecordId, tyConArgs), ValueRecord(mbRecordId, flds)) =>
             mbRecordId match {
-              case Some(recordId_) if recordId != recordId_ =>
+              case Some(valueRecordId) if typeRecordId != valueRecordId =>
                 fail(
-                  s"Mismatching record id, the type tells us $recordId, but the value tells us $recordId_")
+                  s"Mismatching record id, the type tells us $typeRecordId, but the value tells us $valueRecordId")
               case _ =>
-                compiledPackages.getPackage(recordId.packageId) match {
-                  // if the package is not there, look it up and restart. stack safe since this will be done
-                  // very few times as the cache gets warm. this is also why we do not use the `Result.needDataType`, which
-                  // would consume stack regardless
+                compiledPackages.getPackage(typeRecordId.packageId) match {
+                  // if the package is not there, ask for all missing packages in the value and restart.
                   case None =>
-                    Result.needPackage(recordId.packageId, _ => restart)
+                    missingPackage
                   case Some(pkg) =>
-                    PackageLookup.lookupRecord(pkg, recordId.qualifiedName) match {
-                      case Left(err) => ResultError(err)
+                    PackageLookup.lookupRecord(pkg, typeRecordId.qualifiedName) match {
+                      case Left(err) => throw ValueTranslationError(err)
                       case Right((dataTypParams, DataRecord(recordFlds, _))) =>
                         // note that we check the number of fields _before_ checking if we can do
                         // field reordering by looking at the labels. this means that it's forbidden to
@@ -230,69 +235,66 @@ private[engine] class ValueTranslator(compiledPackages: CompiledPackages) {
                         // it's ok to do `{"a": 1, "a": 2}`, where the second occurrence would just win.
                         if (recordFlds.length != flds.length) {
                           fail(
-                            s"Expecting ${recordFlds.length} field for record $recordId, but got ${flds.length}")
+                            s"Expecting ${recordFlds.length} field for record $typeRecordId, but got ${flds.length}")
                         }
                         if (dataTypParams.length != tyConArgs.length) {
                           sys.error(
                             "TODO(FM) impossible: type constructor applied to wrong number of parameters, this should never happen on a well-typed package, return better error")
                         }
                         val params = dataTypParams.map(_._1).zip(tyConArgs)
-                        labeledRecordToMap(flds)
-                          .fold {
-                            recordFlds.zip(flds).traverseU {
+                        val fields = labeledRecordToMap(flds) match {
+                          case None =>
+                            (recordFlds zip flds).map {
                               case ((lbl, typ), (mbLbl, v)) =>
                                 mbLbl
                                   .filter(_ != lbl)
                                   .foreach(lbl_ =>
                                     fail(
-                                      s"Mismatching record label $lbl_ (expecting $lbl) for record $recordId"))
+                                      s"Mismatching record label $lbl_ (expecting $lbl) for record $typeRecordId"))
                                 val replacedTyp = replaceParameters(params, typ)
-                                go(newNesting, replacedTyp, v).map(e => (lbl, e))
+                                lbl -> go(newNesting, replacedTyp, v)
                             }
-                          } { labeledRecords =>
-                            recordFlds.traverseU {
+                          case Some(labeledRecords) =>
+                            recordFlds.map {
                               case ((lbl, typ)) =>
                                 labeledRecords
                                   .get(lbl)
-                                  .fold(fail(s"Missing record label $lbl for record $recordId")) {
+                                  .fold(fail(s"Missing record label $lbl for record $typeRecordId")) {
                                     v =>
                                       val replacedTyp = replaceParameters(params, typ)
-                                      go(newNesting, replacedTyp, v).map(e => (lbl, e))
+                                      lbl -> go(newNesting, replacedTyp, v)
                                   }
                             }
-                          }
-                          .map(
-                            flds =>
-                              SRecord(
-                                tyCon,
-                                Name.Array(flds.map(_._1).toSeq: _*),
-                                ArrayList(flds.map(_._2).toSeq: _*)
-                            ))
+                        }
+
+                        SRecord(
+                          typeRecordId,
+                          Name.Array(fields.map(_._1).toSeq: _*),
+                          ArrayList(fields.map(_._2).toSeq: _*)
+                        )
                     }
                 }
             }
 
-          case (TTyCon(id), ValueEnum(mbId, constructor)) =>
+          case (TTyCon(typeEnumId), ValueEnum(mbId, constructor)) =>
             mbId match {
-              case Some(id_) if id_ != id =>
-                fail(s"Mismatching enum id, the type tells us $id, but the value tells us $id_")
+              case Some(valueEnumId) if valueEnumId != typeEnumId =>
+                fail(
+                  s"Mismatching enum id, the type tells us $typeEnumId, but the value tells us $valueEnumId")
               case _ =>
-                compiledPackages.getPackage(id.packageId) match {
-                  // if the package is not there, look it up and restart. stack safe since this will be done
-                  // very few times as the cache gets warm. this is also why we do not use the `Result.needDataType`, which
-                  // would consume stack regardless
+                compiledPackages.getPackage(typeEnumId.packageId) match {
                   case None =>
-                    Result.needPackage(id.packageId, _ => restart)
+                    missingPackage
                   case Some(pkg) =>
-                    PackageLookup.lookupEnum(pkg, id.qualifiedName) match {
-                      case Left(err) => ResultError(err)
+                    PackageLookup.lookupEnum(pkg, typeEnumId.qualifiedName) match {
+                      case Left(err) => throw ValueTranslationError(err)
                       case Right(dataDef: DataEnum) =>
                         dataDef.constructorRank.get(constructor) match {
                           case Some(rank) =>
-                            ResultDone(SEnum(id, constructor, rank))
+                            SEnum(typeEnumId, constructor, rank)
                           case None =>
                             fail(
-                              s"Couldn't find provided variant constructor $constructor in enum $id")
+                              s"Couldn't find provided variant constructor $constructor in enum $typeEnumId")
                         }
                     }
                 }
@@ -305,7 +307,20 @@ private[engine] class ValueTranslator(compiledPackages: CompiledPackages) {
       }
     }
 
-    exceptionToResultError(go(0, ty0, v0))
+    def restart: Result[SValue] =
+      try {
+        ResultDone(go(0, ty0, v0))
+      } catch {
+        case ValueTranslationError(e) => ResultError(e)
+        case ValueTranslationMissingPackage =>
+          // if one package is missing, we collect all of them, ask of them, and restart.
+          needPackages(
+            collectPkgIds(ty0).filterNot(compiledPackages.packages.isDefinedAt).toList,
+            restart
+          )
+      }
+
+    restart
   }
 
 }
