@@ -26,7 +26,8 @@ private[engine] object ValueTranslator {
     a
   }
 
-  // we use this for easier error handling in translateValues
+  // we use the following exceptions for easier error handling in translateValues
+
   private final case class ValueTranslationError(err: Error)
       extends RuntimeException(err.toString, null, true, false)
 
