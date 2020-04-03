@@ -19,7 +19,9 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
   private[engine] def translateValue(
       ty0: Type,
       v0: Value[Value.AbsoluteContractId],
-  ): Result[SValue] = {
+  ): Result[(SValue, Set[Value.AbsoluteContractId])] = {
+
+    val cids = Value.collectCids(v0)
 
     valueTranslator.translateValue(ty0, v0) match {
       case ResultNeedPackage(pkgId, resume) =>
@@ -27,18 +29,18 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
           pkgId, {
             case None => ResultError(Error(s"Couldn't find package $pkgId"))
             case Some(pkg) =>
-              compiledPackages.addPackage(pkgId, pkg).flatMap(_ => resume(Some(pkg)))
+              compiledPackages.addPackage(pkgId, pkg).flatMap(_ => resume(Some(pkg)).map(_ -> cids))
           }
         )
       case result =>
-        result
+        result.map(_ -> cids)
     }
   }
 
   private[engine] def preprocessCreate(
       templateId: Identifier,
       argument: Value[Value.AbsoluteContractId],
-  ): Result[SpeedyCommand] =
+  ): Result[(SpeedyCommand, Set[Value.AbsoluteContractId])] =
     Result.needDataType(
       compiledPackages,
       templateId,
@@ -50,7 +52,10 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
             s"Unexpected type parameters ${dataType.params} for template $templateId. Template datatypes should never have parameters."))
         } else {
           translateValue(TTyCon(templateId), argument)
-            .map(SpeedyCommand.Create(templateId, _))
+            .map {
+              case (arg, argCids) =>
+                SpeedyCommand.Create(templateId, arg) -> argCids
+            }
         }
       }
     )
@@ -58,7 +63,7 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
   private[engine] def preprocessFetch(
       templateId: Identifier,
       coid: Value.AbsoluteContractId,
-  ): Result[SpeedyCommand] =
+  ): Result[(SpeedyCommand, Set[Value.AbsoluteContractId])] =
     Result.needDataType(
       compiledPackages,
       templateId,
@@ -69,7 +74,7 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
           ResultError(Error(
             s"Unexpected type parameters ${dataType.params} for template $templateId. Template datatypes should never have parameters."))
         } else {
-          ResultDone(SpeedyCommand.Fetch(templateId, SValue.SContractId(coid)))
+          ResultDone(SpeedyCommand.Fetch(templateId, SValue.SContractId(coid)) -> Set(coid))
         }
       }
     )
@@ -79,7 +84,7 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
       contractId: Value.ContractId,
       choiceId: ChoiceName,
       argument: Value[Value.AbsoluteContractId],
-  ): Result[SpeedyCommand] =
+  ): Result[(SpeedyCommand, Set[Value.AbsoluteContractId])] =
     Result.needTemplate(
       compiledPackages,
       templateId,
@@ -91,8 +96,16 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
               s"Couldn't find requested choice $choiceId for template $templateId. Available choices: $choicesNames"))
           case Some(choice) =>
             val choiceTyp = choice.argBinder._2
-            translateValue(choiceTyp, argument).map(
-              SpeedyCommand.Exercise(templateId, SValue.SContractId(contractId), choiceId, _))
+            translateValue(choiceTyp, argument).map {
+              case (choiceArg, choiceArgCids) =>
+                val cids = contractId match {
+                  case acoid: Value.AbsoluteContractId => choiceArgCids + acoid
+                  case _ => choiceArgCids
+                }
+                SpeedyCommand
+                  .Exercise(templateId, SValue.SContractId(contractId), choiceId, choiceArg) ->
+                  cids
+            }
         }
       }
     )
@@ -102,7 +115,7 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
       contractKey: Value[Value.AbsoluteContractId],
       choiceId: ChoiceName,
       argument: Value[Value.AbsoluteContractId],
-  ): Result[SpeedyCommand] =
+  ): Result[(SpeedyCommand, Set[Value.AbsoluteContractId])] =
     Result.needTemplate(
       compiledPackages,
       templateId,
@@ -118,9 +131,12 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
           case (Some(choice), Some(ck)) =>
             val (_, choiceType) = choice.argBinder
             for {
-              arg <- translateValue(choiceType, argument)
-              key <- translateValue(ck.typ, contractKey)
-            } yield SpeedyCommand.ExerciseByKey(templateId, key, choiceId, arg)
+              argWithCids <- translateValue(choiceType, argument)
+              (arg, argCids) = argWithCids
+              keyWithCids <- translateValue(ck.typ, contractKey)
+              (key, keyCids) = keyWithCids
+            } yield
+              SpeedyCommand.ExerciseByKey(templateId, key, choiceId, arg) -> (argCids ++ keyCids)
         }
       }
     )
@@ -130,7 +146,7 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
       createArgument: Value[Value.AbsoluteContractId],
       choiceId: ChoiceName,
       choiceArgument: Value[Value.AbsoluteContractId],
-  ): Result[SpeedyCommand] = {
+  ): Result[(SpeedyCommand, Set[Value.AbsoluteContractId])] = {
     Result.needDataType(
       compiledPackages,
       templateId,
@@ -143,7 +159,7 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
         } else {
           val typ = TTyCon(templateId)
           translateValue(typ, createArgument).flatMap {
-            createValue =>
+            case (createArg, createArgCids) =>
               Result.needTemplate(
                 compiledPackages,
                 templateId,
@@ -155,9 +171,12 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
                         s"Couldn't find requested choice $choiceId for template $templateId. Available choices: $choicesNames"))
                     case Some(choice) =>
                       val choiceTyp = choice.argBinder._2
-                      translateValue(choiceTyp, choiceArgument).map(
-                        SpeedyCommand
-                          .CreateAndExercise(templateId, createValue, choiceId, _))
+                      translateValue(choiceTyp, choiceArgument).map {
+                        case (choiceArg, choiceArgCids) =>
+                          SpeedyCommand
+                            .CreateAndExercise(templateId, createArg, choiceId, choiceArg) ->
+                            (createArgCids ++ choiceArgCids)
+                      }
                   }
                 }
               )
@@ -169,8 +188,8 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
 
   private[engine] def preprocessLookupByKey(
       templateId: ValueRef,
-      contractKey: Value[Nothing],
-  ): Result[SpeedyCommand] = {
+      contractKey: Value[Nohting],
+  ): Result[(SpeedyCommand, Set[Value.AbsoluteContractId])] = {
     Result.needTemplate(
       compiledPackages,
       templateId,
@@ -181,14 +200,17 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
               Error(s"Impossible to lookup by key, no key is defined for template $templateId"))
           case Some(ck) =>
             for {
-              key <- translateValue(ck.typ, contractKey)
-            } yield SpeedyCommand.LookupByKey(templateId, key)
+              keyWithCids <- translateValue(ck.typ, contractKey)
+              (key, keyCids) = keyWithCids
+            } yield SpeedyCommand.LookupByKey(templateId, key) -> keyCids
         }
       }
     )
   }
 
-  private[engine] def preprocessCommand(cmd: Command): Result[SpeedyCommand] =
+  private def preprocessCommand(
+      cmd: Command,
+  ): Result[(SpeedyCommand, Set[Value.AbsoluteContractId])] =
     cmd match {
       case CreateCommand(templateId, argument) =>
         preprocessCreate(templateId, argument)
@@ -217,7 +239,7 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
 
   private[engine] def preprocessCommands(
       cmds0: Commands,
-  ): Result[ImmArray[SpeedyCommand]] = {
+  ): Result[(ImmArray[SpeedyCommand], Set[Value.AbsoluteContractId])] = {
     // before, we had
     //
     // ```
@@ -231,37 +253,40 @@ private[engine] class CommandPreprocessor(compiledPackages: MutableCompiledPacka
     @tailrec
     def go(
         processed: BackStack[SpeedyCommand],
+        cids: Set[Value.AbsoluteContractId],
         toProcess: ImmArray[Command],
-    ): Result[ImmArray[SpeedyCommand]] = {
+    ): Result[(ImmArray[SpeedyCommand], Set[Value.AbsoluteContractId])] = {
       toProcess match {
-        case ImmArray() => ResultDone(processed.toImmArray)
+        case ImmArray() => ResultDone(processed.toImmArray -> cids)
         case ImmArrayCons(cmd, cmds) =>
           preprocessCommand(cmd) match {
-            case ResultDone(processedCommand) => go(processed :+ processedCommand, cmds)
+            case ResultDone((processedCommand, cmdCids)) =>
+              go(processed :+ processedCommand, cids ++ cmdCids, cmds)
             case ResultError(err) => ResultError(err)
             case ResultNeedContract(acoid, resume) =>
-              ResultNeedContract(acoid, { contract =>
-                resume(contract).flatMap(processedCommand =>
-                  goResume(processed :+ processedCommand, cmds))
-              })
+              ResultNeedContract(acoid, goResume(resume, processed, cids, cmds))
             case ResultNeedPackage(pkgId, resume) =>
-              ResultNeedPackage(pkgId, { pkg =>
-                resume(pkg).flatMap(processedCommand =>
-                  goResume(processed :+ processedCommand, cmds))
-              })
+              ResultNeedPackage(pkgId, goResume(resume, processed, cids, cmds))
             case ResultNeedKey(key, resume) =>
-              ResultNeedKey(key, { contract =>
-                resume(contract).flatMap(processedCommand =>
-                  goResume(processed :+ processedCommand, cmds))
-              })
+              ResultNeedKey(key, goResume(resume, processed, cids, cmds))
           }
       }
     }
 
-    def goResume(processed: BackStack[SpeedyCommand], toProcess: ImmArray[Command]) =
-      go(processed, toProcess)
+    def goResume[X](
+        resume: X => Result[(SpeedyCommand, Set[Value.AbsoluteContractId])],
+        processed: BackStack[SpeedyCommand],
+        cids: Set[Value.AbsoluteContractId],
+        toProcess: ImmArray[Command],
+    )(x: X) =
+      for {
+        cmdWithCids <- resume(x)
+        (cmd, cmdCis) = cmdWithCids
+        newCids = cids ++ cmdCis
+        result <- go(processed :+ cmd, newCids, toProcess)
+      } yield result
 
-    go(BackStack.empty, cmds0.commands)
+    go(BackStack.empty, Set.empty, cmds0.commands)
   }
 
 }
