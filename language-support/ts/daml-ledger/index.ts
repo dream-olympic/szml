@@ -225,7 +225,7 @@ type LedgerOptions = {
    * connection is closed after being live for at least this amount of time, the `Ledger` tries to
    * reconnect, else not.
    */
-  wsMinLiveTime?: number;
+  reconnectThreshold?: number;
 }
 
 /**
@@ -235,12 +235,12 @@ class Ledger {
   private readonly token: string;
   private readonly httpBaseUrl: string;
   private readonly wsBaseUrl: string;
-  private readonly wsMinLiveTime: number;
+  private readonly reconnectThreshold: number;
 
   /**
    * Construct a new `Ledger` object. See [[LedgerOptions]] for the constructor arguments.
    */
-  constructor({token, httpBaseUrl, wsBaseUrl, wsMinLiveTime = 30000}: LedgerOptions) {
+  constructor({token, httpBaseUrl, wsBaseUrl, reconnectThreshold = 30000}: LedgerOptions) {
     if (!httpBaseUrl) {
       httpBaseUrl = `${window.location.protocol}//${window.location.host}/`;
     }
@@ -263,7 +263,7 @@ class Ledger {
     this.token = token;
     this.httpBaseUrl = httpBaseUrl;
     this.wsBaseUrl = wsBaseUrl;
-    this.wsMinLiveTime = wsMinLiveTime;
+    this.reconnectThreshold = reconnectThreshold;
   }
 
   /**
@@ -538,7 +538,7 @@ class Ledger {
       const now = new Date().getTime();
       // we try to reconnect if we could connect previously and we were live for at least
       // 'minLiveTime'.
-      if (lastOffset && isLiveSince && now - isLiveSince >= this.wsMinLiveTime) {
+      if (lastOffset && isLiveSince && now - isLiveSince >= this.reconnectThreshold) {
         isLiveSince = undefined;
         ws.send(JSON.stringify(reconnectRequest(lastOffset)));
       }

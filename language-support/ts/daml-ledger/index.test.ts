@@ -164,7 +164,7 @@ describe("streamQuery", () => {
   });
 
   test("reconnect on close", () => {
-    const ledger = new Ledger({...mockOptions, wsMinLiveTime: 0} );
+    const ledger = new Ledger({...mockOptions, reconnectThreshold: 0} );
     const stream = ledger.streamQuery(Foo);
     stream.on("live", mockLive);
     stream.on("close", mockClose);
@@ -260,7 +260,7 @@ describe("streamFetchByKey", () => {
   });
 
   test("reconnect on close", () => {
-    const ledger = new Ledger({...mockOptions, wsMinLiveTime: 0} );
+    const ledger = new Ledger({...mockOptions, reconnectThreshold: 0} );
     const stream = ledger.streamFetchByKey(Foo, fooKey);
     stream.on("live", mockLive);
     stream.on("close", mockClose);
