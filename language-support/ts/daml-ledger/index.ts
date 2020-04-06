@@ -495,7 +495,7 @@ class Ledger {
     template: Template<T, K, I>,
     endpoint: string,
     request: unknown,
-    reconnectRequest: (offset: string) => unknown,
+    reconnectRequest: () => unknown,
     init: State,
     change: (state: State, events: readonly Event<T, K, I>[]) => State,
   ): Stream<T, K, I, State> {
@@ -540,7 +540,8 @@ class Ledger {
       // 'minLiveTime'.
       if (lastOffset && isLiveSince && now - isLiveSince >= this.reconnectThreshold) {
         isLiveSince = undefined;
-        ws.send(JSON.stringify(reconnectRequest(lastOffset)));
+        ws.send(JSON.stringify({'offset': lastOffset}));
+        ws.send(JSON.stringify(reconnectRequest()));
       }
     });
     // TODO(MH): Make types stricter.
@@ -576,7 +577,7 @@ class Ledger {
     query?: Query<T>,
   ): Stream<T, K, I, readonly CreateEvent<T, K, I>[]> {
     const request = {templateIds: [template.templateId], query};
-    const reconnectRequest = ((offset: string): object[] => [{'offset': offset}, request]);
+    const reconnectRequest = (): object[] => [request];
     const change = (contracts: readonly CreateEvent<T, K, I>[], events: readonly Event<T, K, I>[]): CreateEvent<T, K, I>[] => {
       const archiveEvents: Set<ContractId<T>> = new Set();
       const createEvents: CreateEvent<T, K, I>[] = [];
@@ -609,7 +610,7 @@ class Ledger {
   ): Stream<T, K, I, CreateEvent<T, K, I> | null> {
     let lastContractId: ContractId<T> | null = null;
     const request = [{templateId: template.templateId, key}];
-    const reconnectRequest = (offset: string): object[] => [{'offset': offset}, {...request[0], 'contractIdAtOffset': lastContractId}]
+    const reconnectRequest = (): object[] => [{...request[0], 'contractIdAtOffset': lastContractId}]
     const change = (contract: CreateEvent<T, K, I> | null, events: readonly Event<T, K, I>[]): CreateEvent<T, K, I> | null => {
       // NOTE(MH, #4564): We're very lenient here. We should not see a create
       // event when `contract` is currently not null. We should also only see

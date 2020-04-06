@@ -170,8 +170,9 @@ describe("streamQuery", () => {
     stream.on("close", mockClose);
     mockInstance.serverSend({events: [], offset: '3'});
     mockInstance.serverClose({code: 1, reason: 'test close'});
-    expect(mockSend).toHaveBeenCalledTimes(1)
-    expect(mockSend).toHaveBeenLastCalledWith([{"offset": "3"}, {"templateIds": ["foo-id"]}]);
+    expect(mockSend).toHaveBeenCalledTimes(2)
+    expect(mockSend).toHaveBeenNthCalledWith(1, {"offset": "3"});
+    expect(mockSend).toHaveBeenNthCalledWith(2, [{"templateIds": ["foo-id"]}]);
     mockSend.mockClear();
 
     //check that the client doesn't try to reconnect again.
@@ -267,15 +268,17 @@ describe("streamFetchByKey", () => {
     //send live event, but no contract yet.
     mockInstance.serverSend({events: [], offset: '3'});
     mockInstance.serverClose({code: 1, reason: 'test close'});
-    expect(mockSend).toHaveBeenCalledTimes(1)
-    expect(mockSend).toHaveBeenLastCalledWith([{'offset': '3'}, {'key': 'fooKey', 'templateId': 'foo-id', 'contractIdAtOffset': null}]);
+    expect(mockSend).toHaveBeenCalledTimes(2)
+    expect(mockSend).toHaveBeenNthCalledWith(1, {'offset': '3'});
+    expect(mockSend).toHaveBeenNthCalledWith(2, [{'key': 'fooKey', 'templateId': 'foo-id', 'contractIdAtOffset': null}]);
     mockSend.mockClear();
 
     //send live event and set the last contract id.
     mockInstance.serverSend({events: [fooEvent(1)], offset: '3'});
     mockInstance.serverClose({code: 1, reason: 'test close'});
-    expect(mockSend).toHaveBeenCalledTimes(1);
-    expect(mockSend).toHaveBeenLastCalledWith([{'offset': '3'}, {'key': 'fooKey', 'templateId': 'foo-id', 'contractIdAtOffset': '1'}]);
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(mockSend).toHaveBeenNthCalledWith(1, {'offset': '3'});
+    expect(mockSend).toHaveBeenNthCalledWith(2, [{'key': 'fooKey', 'templateId': 'foo-id', 'contractIdAtOffset': '1'}]);
     mockSend.mockClear();
 
     //check that the client doesn't try to reconnect again.
